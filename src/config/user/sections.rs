@@ -439,7 +439,8 @@ pub struct SwitchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cd: Option<bool>,
 
-    /// Clean standalone checkout to clone on APFS when creating a branch at its commit.
+    /// Clean standalone checkout to clone on APFS when creating a worktree.
+    /// Tracked files are updated to the selected branch or base commit.
     /// Includes ignored files, so use a dedicated template without secrets.
     #[serde(rename = "snapshot-from", skip_serializing_if = "Option::is_none")]
     pub snapshot_from: Option<std::path::PathBuf>,

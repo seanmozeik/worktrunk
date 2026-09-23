@@ -79,18 +79,23 @@ fn configure_snapshot_template(repo: &TestRepo) -> PathBuf {
     template
 }
 
+#[cfg(target_os = "macos")]
+fn configure_snapshot_template_with_dependencies(repo: &TestRepo) -> PathBuf {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    let template = configure_snapshot_template(repo);
+    fs::create_dir(template.join("node_modules")).unwrap();
+    fs::write(template.join("node_modules/cache.txt"), "shared\n").unwrap();
+    template
+}
+
 /// A clean standalone checkout provides ignored files while Git still owns
 /// the new branch, index, and linked-worktree registration.
 #[cfg(target_os = "macos")]
 #[rstest]
 fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
-    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
-    repo.run_git(&["add", ".gitignore"]);
-    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
-
-    let template = configure_snapshot_template(&repo);
-    fs::create_dir(template.join("node_modules")).unwrap();
-    fs::write(template.join("node_modules/cache.txt"), "shared\n").unwrap();
+    let template = configure_snapshot_template_with_dependencies(&repo);
 
     let output = repo
         .wt_command()
@@ -161,25 +166,173 @@ fn test_switch_snapshot_rejects_dirty_template(repo: TestRepo) {
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_snapshot_uses_git_checkout_for_new_base(repo: TestRepo) {
-    let _template = configure_snapshot_template(&repo);
+fn test_switch_snapshot_uses_git_checkout_when_template_commit_is_absent(repo: TestRepo) {
+    let unrelated = TestRepo::with_initial_commit();
+    unrelated.commit("Unrelated template commit");
+    repo.write_test_config(&format!(
+        "[switch]\nsnapshot-from = {:?}\n",
+        unrelated.root_path().to_str().unwrap()
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "from-git", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("normal Git checkout"));
+    let worktree = repo.home_path().join("repo.from-git");
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_updates_tracked_files_to_new_base(repo: TestRepo) {
+    configure_snapshot_template_with_dependencies(&repo);
     repo.commit("New base commit");
-    let fallback = repo
+    let output = repo
         .wt_command()
         .args(["switch", "--create", "new-base", "--no-cd"])
         .output()
         .unwrap();
     assert!(
-        fallback.status.success(),
+        output.status.success(),
         "{}",
-        String::from_utf8_lossy(&fallback.stderr)
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&fallback.stderr).contains("normal Git checkout"));
     let worktree = repo.home_path().join("repo.new-base");
     assert_eq!(
         fs::read_to_string(worktree.join("file.txt")).unwrap(),
         "New base commit"
     );
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_uses_selected_branch_head(repo: TestRepo) {
+    configure_snapshot_template_with_dependencies(&repo);
+
+    repo.run_git(&["switch", "-c", "release"]);
+    repo.run_git(&["rm", "file.txt"]);
+    fs::write(repo.root_path().join("release.txt"), "release\n").unwrap();
+    repo.run_git(&["add", "release.txt"]);
+    repo.run_git(&["commit", "-m", "Release branch"]);
+    let release_head = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .run()
+        .unwrap();
+    let release_head = String::from_utf8_lossy(&release_head.stdout);
+    repo.run_git(&["switch", "main"]);
+
+    let output = repo
+        .wt_command()
+        .args([
+            "switch",
+            "--create",
+            "from-release",
+            "--base",
+            "release",
+            "--no-cd",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.from-release");
+    assert!(!worktree.join("file.txt").exists());
+    assert_eq!(
+        fs::read_to_string(worktree.join("release.txt")).unwrap(),
+        "release\n"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(
+        linked.run_command(&["rev-parse", "HEAD"]).unwrap(),
+        release_head
+    );
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_creates_worktree_for_existing_local_branch(repo: TestRepo) {
+    configure_snapshot_template_with_dependencies(&repo);
+    repo.commit("New branch head");
+    repo.run_git(&["branch", "existing"]);
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "existing", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.existing");
+    assert_eq!(
+        fs::read_to_string(worktree.join("file.txt")).unwrap(),
+        "New branch head"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_creates_worktree_for_remote_branch(
+    #[from(repo_with_remote)] repo: TestRepo,
+) {
+    configure_snapshot_template_with_dependencies(&repo);
+    repo.commit("New remote head");
+    repo.run_git(&["branch", "remote-snapshot"]);
+    repo.run_git(&["push", "origin", "remote-snapshot"]);
+    repo.run_git(&["branch", "-D", "remote-snapshot"]);
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "remote-snapshot", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.remote-snapshot");
+    assert_eq!(
+        fs::read_to_string(worktree.join("file.txt")).unwrap(),
+        "New remote head"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
 }
 
 #[cfg(target_os = "macos")]

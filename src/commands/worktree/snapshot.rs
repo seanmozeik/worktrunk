@@ -15,19 +15,23 @@ use worktrunk::shell_exec::Cmd;
 pub(super) struct PreparedSnapshot {
     temporary: tempfile::TempDir,
     source: PathBuf,
-    commit: String,
+    target_commit: String,
 }
 
-/// Prepare before `git worktree add`, so a failed clone leaves no new branch.
-/// A template at another commit cannot produce the requested tree: use Git's
-/// normal checkout in that case.
+#[cfg(target_os = "macos")]
+pub(super) enum SnapshotPlan {
+    Prepared(PreparedSnapshot),
+    Checkout(anyhow::Error),
+}
+
+/// Prepare the selected commit before `git worktree add` creates a worktree.
 #[cfg(target_os = "macos")]
 pub(super) fn prepare(
     repo: &Repository,
     configured_source: &Path,
-    base: Option<&str>,
+    target_ref: &str,
     destination: &Path,
-) -> anyhow::Result<Option<PreparedSnapshot>> {
+) -> anyhow::Result<SnapshotPlan> {
     if !configured_source.is_absolute() {
         bail!("switch.snapshot-from must be an absolute path");
     }
@@ -54,17 +58,12 @@ pub(super) fn prepare(
             source.display()
         );
     }
-    let commit = git_at(&source, &["rev-parse", "HEAD"])?;
-    let commit = commit.trim().to_owned();
-    let target_commit = repo.run_command(&[
-        "rev-parse",
-        "--verify",
-        "--end-of-options",
-        base.unwrap_or("HEAD"),
-    ])?;
-    if commit != target_commit.trim() {
-        return Ok(None);
-    }
+    let source_commit = git_at(&source, &["rev-parse", "HEAD"])?;
+    let source_commit = source_commit.trim();
+    let base_commit = format!("{target_ref}^{{commit}}");
+    let target_commit =
+        repo.run_command(&["rev-parse", "--verify", "--end-of-options", &base_commit])?;
+    let target_commit = target_commit.trim();
     ensure_clean(&source)?;
     let tracked = git_at(&source, &["ls-files", "--stage", "-z"])?;
     if tracked
@@ -77,6 +76,13 @@ pub(super) fn prepare(
     let destination_resolved = worktrunk::path::canonicalize_with_parents(destination);
     if destination_resolved.starts_with(&source) || source.starts_with(&destination_resolved) {
         bail!("Snapshot template and new worktree paths must not contain each other");
+    }
+    if let Err(error) =
+        repo.run_command(&["cat-file", "-e", &format!("{source_commit}^{{commit}}")])
+    {
+        return Ok(SnapshotPlan::Checkout(
+            error.context("Template commit is absent from the target repository"),
+        ));
     }
 
     let parent = destination
@@ -99,17 +105,60 @@ pub(super) fn prepare(
     fs::remove_dir_all(staged.join(".git"))?;
     ensure_clean(&source)?;
     let after = git_at(&source, &["rev-parse", "HEAD"])?;
-    if after.trim() != commit {
+    if after.trim() != source_commit {
         bail!(
             "Snapshot template changed while it was copied: {}",
             source.display()
         );
     }
-    Ok(Some(PreparedSnapshot {
+    if source_commit != target_commit
+        && let Err(error) = reconcile_to_target(
+            repo,
+            &staged,
+            temporary.path(),
+            source_commit,
+            target_commit,
+        )
+    {
+        return Ok(SnapshotPlan::Checkout(error));
+    }
+    Ok(SnapshotPlan::Prepared(PreparedSnapshot {
         temporary,
         source,
-        commit,
+        target_commit: target_commit.to_owned(),
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn reconcile_to_target(
+    repo: &Repository,
+    staged: &Path,
+    temporary: &Path,
+    source_commit: &str,
+    target_commit: &str,
+) -> anyhow::Result<()> {
+    let index = temporary.join("snapshot-index");
+    let run = |args: &[&str]| -> anyhow::Result<()> {
+        let output = Cmd::new("git")
+            .args(args.iter().copied())
+            .current_dir(staged)
+            .scrub_git_discovery_env()
+            .env("GIT_DIR", repo.git_common_dir())
+            .env("GIT_WORK_TREE", staged)
+            .env("GIT_INDEX_FILE", &index)
+            .run()?;
+        if !output.status.success() {
+            return Err(CommandError::from_failed_output("git", args, &output).into());
+        }
+        Ok(())
+    };
+    run(&["read-tree", source_commit])?;
+    run(&["update-index", "--refresh"])?;
+    run(&["read-tree", "-m", "-u", source_commit, target_commit])
+        .context("Cannot update snapshot files to the selected base commit")?;
+    run(&["diff-files", "--quiet"])
+        .context("Snapshot files differ from the selected base commit")?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -147,7 +196,7 @@ impl PreparedSnapshot {
         let empty = self.temporary.path().join("empty-worktree");
         let linked = repo.worktree_at(destination);
         let actual_commit = linked.run_command(&["rev-parse", "HEAD"])?;
-        if actual_commit.trim() != self.commit {
+        if actual_commit.trim() != self.target_commit {
             bail!(
                 "New worktree base changed during snapshot creation; empty worktree kept: {}",
                 destination.display()
@@ -196,7 +245,7 @@ impl PreparedSnapshot {
         log::debug!(
             "Installed APFS snapshot from {} at {}",
             self.source.display(),
-            self.commit
+            self.target_commit
         );
         Ok(())
     }

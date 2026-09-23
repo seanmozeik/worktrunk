@@ -311,14 +311,14 @@ All gitignored files are copied by default. To limit what gets copied, create `.
 
 #### APFS snapshot creation (fork feature)
 
-On macOS with APFS, this fork can clone a prepared standalone checkout when `wt switch --create` starts at the same commit. Put the source path in your personal Worktrunk config:
+On macOS with APFS, this fork can clone a prepared standalone checkout when `wt switch` creates a worktree. Git updates tracked files in the copy to the new branch's selected base or an existing branch's head, so the template can be older than `main` or on another branch. Put the source path in your personal Worktrunk config:
 
 ```toml
 [projects."github.com/example/project".switch]
 snapshot-from = "/absolute/path/to/clean-project-template"
 ```
 
-The template must have a `.git` directory, no tracked changes, and no submodules. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. When the requested base differs from the template commit, Worktrunk warns and uses a normal Git checkout. Existing branches and worktrees use the usual path. The new worktree remains linked to the shared Git repository. A failed snapshot keeps the new worktree for inspection if Git has already registered it.
+The template must have a `.git` directory, no tracked changes, and no submodules. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. Keeping the template near a common base reduces the tracked files Git must update and the extra APFS space those updates use. If its commit is absent from the target repository, or Git cannot update the copied files, Worktrunk warns and uses a normal checkout. Switching to an existing worktree only changes directories. A remote-only branch uses the snapshot when it has one matching remote. The new worktree remains linked to the shared Git repository. A failed installation keeps the new worktree for inspection if Git has already registered it.
 
 For pnpm projects, run a blocking `pre-start` install after the snapshot. pnpm executable wrappers can contain absolute paths back to the template:
 

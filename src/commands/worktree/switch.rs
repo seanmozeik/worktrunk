@@ -999,6 +999,33 @@ fn operational_worktree_path(path: PathBuf) -> PathBuf {
     canonicalize(&path).unwrap_or(path)
 }
 
+#[cfg(target_os = "macos")]
+fn snapshot_base_ref(
+    repo: &Repository,
+    branch: &str,
+    method: &CreationMethod,
+) -> anyhow::Result<Option<String>> {
+    match method {
+        CreationMethod::Regular {
+            create_branch: true,
+            base_branch,
+            ..
+        } => Ok(Some(base_branch.clone().unwrap_or_else(|| "HEAD".into()))),
+        CreationMethod::Regular {
+            create_branch: false,
+            ..
+        } => {
+            let branch_handle = repo.branch(branch);
+            if branch_handle.exists_locally()? {
+                return Ok(Some(branch.to_owned()));
+            }
+            let remotes = branch_handle.remotes()?;
+            Ok((remotes.len() == 1).then(|| format!("{}/{}", remotes[0], branch)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn same_worktree_path(left: &Path, right: &Path) -> bool {
     WorktreeId::new(left) == WorktreeId::new(right)
 }
@@ -1056,43 +1083,29 @@ fn execute_switch(
                 .switch(repo.project_identifier().ok().as_deref())
                 .snapshot_from;
             #[cfg(target_os = "macos")]
-            let prepared_snapshot = match (&method, snapshot_source.as_deref()) {
-                (
-                    CreationMethod::Regular {
-                        create_branch: true,
-                        base_branch,
-                        ..
-                    },
-                    Some(source),
-                ) => {
-                    let prepared = super::snapshot::prepare(
-                        repo,
-                        source,
-                        base_branch.as_deref(),
-                        &worktree_path,
-                    )?;
-                    if prepared.is_none() {
-                        eprintln!(
-                            "{}",
-                            warning_message(
-                                "Snapshot template is at another commit; using a normal Git checkout"
-                            )
-                        );
-                    }
-                    prepared
+            let snapshot_plan = if let Some(source) = snapshot_source.as_deref() {
+                snapshot_base_ref(repo, &branch, &method)?
+                    .map(|base| super::snapshot::prepare(repo, source, &base, &worktree_path))
+                    .transpose()?
+            } else {
+                None
+            };
+            #[cfg(target_os = "macos")]
+            let prepared_snapshot = match snapshot_plan {
+                Some(super::snapshot::SnapshotPlan::Prepared(snapshot)) => Some(snapshot),
+                Some(super::snapshot::SnapshotPlan::Checkout(error)) => {
+                    eprintln!(
+                        "{}",
+                        warning_message(format!(
+                            "Cannot use APFS snapshot ({error:#}); using a normal Git checkout"
+                        ))
+                    );
+                    None
                 }
-                _ => None,
+                None => None,
             };
             #[cfg(not(target_os = "macos"))]
-            if snapshot_source.is_some()
-                && matches!(
-                    &method,
-                    CreationMethod::Regular {
-                        create_branch: true,
-                        ..
-                    }
-                )
-            {
+            if snapshot_source.is_some() && matches!(&method, CreationMethod::Regular { .. }) {
                 bail!("switch.snapshot-from requires macOS APFS");
             }
 
