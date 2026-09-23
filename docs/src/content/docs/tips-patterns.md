@@ -317,24 +317,28 @@ Use `pre-start` instead when an `--execute` command needs the copied files immed
 
 All gitignored files are copied by default. To limit what gets copied, create `.worktreeinclude` with patterns — files must be both gitignored and listed. See [`wt step copy-ignored`](/step/#wt-step-copy-ignored) for details.
 
-#### APFS snapshot creation (fork feature)
+#### Automatic APFS worktree copies
 
-On macOS with APFS, this fork can clone a prepared standalone checkout when `wt switch` creates a worktree. Git updates tracked files in the copy to the new branch's selected base or an existing branch's head, so the template can be older than `main` or on another branch. Put the source path in your personal Worktrunk config:
+On macOS with APFS, `wt switch` reuses a clean worktree that has `node_modules/`, `target/`, or `.venv/`. It also checks `.wt-templates/<repo-name>/` beside the primary worktree, so a prepared template can remain after other worktrees are removed. No snapshot setting is needed. Git still creates the branch and linked worktree. Worktrunk copies the source directory, removes unrelated ignored and untracked files, and updates tracked files to the selected branch head or base commit. A source at an older commit is valid. If no suitable source works, creation uses a normal Git checkout.
 
-```toml
-[projects."github.com/example/project".switch]
-snapshot-from = "/absolute/path/to/clean-project-template"
-```
-
-The template must have a `.git` directory, no tracked changes, and no submodules. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. Keeping the template near a common base reduces the tracked files Git must update and the extra APFS space those updates use. If its commit is absent from the target repository, or Git cannot update the copied files, Worktrunk warns and uses a normal checkout. Switching to an existing worktree only changes directories. A remote-only branch uses the snapshot when it has one matching remote. The new worktree remains linked to the shared Git repository. A failed installation keeps the new worktree for inspection if Git has already registered it.
-
-For pnpm projects, run a blocking `pre-start` install after the snapshot. pnpm executable wrappers can contain absolute paths back to the template:
+The copy keeps the recognized cache directories and removes other ignored and untracked paths, such as a root `.env` or scratch file. Keep secrets out of dependency and build caches. Package managers may still need to update copied paths and packages. Use a blocking `pre-start` hook for pnpm or Bun when the new worktree must be ready before an agent starts:
 
 ```toml
-# .config/wt.toml in the project
+# .config/wt.toml in a pnpm project
 [pre-start]
 install = "pnpm install --frozen-lockfile --prefer-offline"
 ```
+
+For a Bun project, use `bun install --frozen-lockfile` in the same hook. Cargo checks copied `target/` artifacts when the next build runs. Worktrunk's normal hook approval rules apply to project hooks.
+
+To disable automatic copies for a project, set `snapshot = false` in its personal Worktrunk override. `snapshot-from` remains available when a dedicated source is better than the available worktrees:
+
+```toml
+[projects."github.com/example/project".switch]
+snapshot-from = "/absolute/path/to/clean-template"
+```
+
+An explicit template must be a clean standalone Git checkout without submodules. It copies all ignored and untracked files, so keep secrets and unrelated output out of that template. Existing worktrees only switch directories; the snapshot path runs when Worktrunk creates a linked worktree.
 
 ### Subdomain routing with Caddy
 

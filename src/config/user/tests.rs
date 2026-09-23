@@ -1198,6 +1198,16 @@ fn test_switch_snapshot_source_merges() {
 }
 
 #[test]
+fn test_switch_snapshot_defaults_on_and_project_override_can_disable_it() {
+    use crate::config::user::{Merge, SwitchConfig};
+
+    let default = SwitchConfig::default();
+    let disabled: SwitchConfig = toml::from_str("snapshot = false").unwrap();
+    assert!(default.snapshot());
+    assert!(!default.merge_with(&disabled).snapshot());
+}
+
+#[test]
 fn test_switch_config_cd_accessor() {
     use crate::config::user::SwitchConfig;
 

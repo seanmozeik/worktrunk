@@ -1077,16 +1077,27 @@ fn execute_switch(
             needs_clobber_backup,
             new_previous,
         } => {
-            // Validate and stage the optional snapshot before --clobber can
-            // move an existing path or Git can create the new branch.
-            let snapshot_source = config
-                .switch(repo.project_identifier().ok().as_deref())
-                .snapshot_from;
+            // Validate and stage the copy before --clobber can move an
+            // existing path or Git can create the new branch.
+            let switch_config = config.switch(repo.project_identifier().ok().as_deref());
+            let snapshot_source = switch_config.snapshot_from.as_deref();
             #[cfg(target_os = "macos")]
-            let snapshot_plan = if let Some(source) = snapshot_source.as_deref() {
-                snapshot_base_ref(repo, &branch, &method)?
-                    .map(|base| super::snapshot::prepare(repo, source, &base, &worktree_path))
-                    .transpose()?
+            let snapshot_plan = if switch_config.snapshot() {
+                if let Some(base) = snapshot_base_ref(repo, &branch, &method)? {
+                    if let Some(source) = snapshot_source {
+                        Some(super::snapshot::prepare(
+                            repo,
+                            source,
+                            &base,
+                            &worktree_path,
+                        )?)
+                    } else {
+                        super::snapshot::prepare_auto(repo, &base, &worktree_path)
+                            .map(super::snapshot::SnapshotPlan::Prepared)
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             };

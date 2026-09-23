@@ -24,6 +24,80 @@ pub(super) enum SnapshotPlan {
     Checkout(anyhow::Error),
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Configured,
+    Automatic,
+}
+
+/// Find a reusable checkout without requiring a per-project template path.
+/// Existing worktrees provide their local dependency caches; a prepared
+/// standalone template beside the repository remains useful after worktrees
+/// are removed.
+#[cfg(target_os = "macos")]
+pub(super) fn prepare_auto(
+    repo: &Repository,
+    target_ref: &str,
+    destination: &Path,
+) -> Option<PreparedSnapshot> {
+    let target_commit = resolve_commit(repo, target_ref).ok()?;
+    let template = repo.home_path().ok().and_then(|home| {
+        home.parent()
+            .zip(home.file_name())
+            .map(|(parent, name)| parent.join(".wt-templates").join(name))
+    });
+    let mut exact = Vec::new();
+    let mut older = Vec::new();
+    if let Ok(worktrees) = repo.list_worktrees() {
+        for worktree in worktrees
+            .iter()
+            .filter(|worktree| !worktree.is_prunable() && worktree.path.is_dir())
+        {
+            if worktree.head == target_commit {
+                exact.push(worktree.path.clone());
+            } else {
+                older.push(worktree.path.clone());
+            }
+        }
+    }
+    // Linked worktrees have a small .git pointer. The primary checkout can
+    // carry a large Git database that would be copied only to be removed.
+    exact.sort_by_key(|path| !path.join(".git").is_file());
+    older.sort_by_key(|path| !path.join(".git").is_file());
+    let mut candidates = exact;
+    if let Some(template) = template.filter(|path| path.is_dir()) {
+        candidates.push(template);
+    }
+    candidates.extend(older);
+
+    for candidate in candidates {
+        if !has_dependency_cache(&candidate) {
+            continue;
+        }
+        match prepare_source(
+            repo,
+            &candidate,
+            &target_commit,
+            destination,
+            SourceKind::Automatic,
+        ) {
+            Ok(SnapshotPlan::Prepared(snapshot)) => return Some(snapshot),
+            Ok(SnapshotPlan::Checkout(error)) | Err(error) => {
+                log::debug!("Cannot snapshot {}: {error:#}", candidate.display());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn has_dependency_cache(source: &Path) -> bool {
+    ["node_modules", "target", ".venv"].into_iter().any(|name| {
+        fs::symlink_metadata(source.join(name)).is_ok_and(|metadata| metadata.file_type().is_dir())
+    })
+}
+
 /// Prepare the selected commit before `git worktree add` creates a worktree.
 #[cfg(target_os = "macos")]
 pub(super) fn prepare(
@@ -31,6 +105,31 @@ pub(super) fn prepare(
     configured_source: &Path,
     target_ref: &str,
     destination: &Path,
+) -> anyhow::Result<SnapshotPlan> {
+    let target_commit = resolve_commit(repo, target_ref)?;
+    prepare_source(
+        repo,
+        configured_source,
+        &target_commit,
+        destination,
+        SourceKind::Configured,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_commit(repo: &Repository, target_ref: &str) -> anyhow::Result<String> {
+    let commit = format!("{target_ref}^{{commit}}");
+    repo.run_command(&["rev-parse", "--verify", "--end-of-options", &commit])
+        .map(|output| output.trim().to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_source(
+    repo: &Repository,
+    configured_source: &Path,
+    target_commit: &str,
+    destination: &Path,
+    source_kind: SourceKind,
 ) -> anyhow::Result<SnapshotPlan> {
     if !configured_source.is_absolute() {
         bail!("switch.snapshot-from must be an absolute path");
@@ -41,14 +140,15 @@ pub(super) fn prepare(
             configured_source.display()
         )
     })?;
-    if !fs::symlink_metadata(source.join(".git"))?
-        .file_type()
-        .is_dir()
-    {
+    let git_metadata = fs::symlink_metadata(source.join(".git"))?;
+    if matches!(source_kind, SourceKind::Configured) && !git_metadata.file_type().is_dir() {
         bail!(
             "Snapshot template must be a standalone Git checkout: {}",
             source.display()
         );
+    }
+    if !git_metadata.file_type().is_dir() && !git_metadata.file_type().is_file() {
+        bail!("Snapshot source has no Git metadata: {}", source.display());
     }
     let source_root = PathBuf::from(git_at(&source, &["rev-parse", "--show-toplevel"])?.trim());
     let source_root = dunce::canonicalize(source_root)?;
@@ -60,10 +160,6 @@ pub(super) fn prepare(
     }
     let source_commit = git_at(&source, &["rev-parse", "HEAD"])?;
     let source_commit = source_commit.trim();
-    let base_commit = format!("{target_ref}^{{commit}}");
-    let target_commit =
-        repo.run_command(&["rev-parse", "--verify", "--end-of-options", &base_commit])?;
-    let target_commit = target_commit.trim();
     ensure_clean(&source)?;
     let tracked = git_at(&source, &["ls-files", "--stage", "-z"])?;
     if tracked
@@ -100,9 +196,15 @@ pub(super) fn prepare(
         .tempdir_in(parent)?;
     let staged = temporary.path().join("tree");
     reflink_copy::reflink(&source, &staged).context("APFS snapshot failed")?;
-    // The cloned repository has its own Git database. The linked worktree's
-    // small .git pointer replaces it at installation time.
-    fs::remove_dir_all(staged.join(".git"))?;
+    // The new linked worktree supplies its own .git pointer at installation.
+    if git_metadata.file_type().is_dir() {
+        fs::remove_dir_all(staged.join(".git"))?;
+    } else {
+        fs::remove_file(staged.join(".git"))?;
+    }
+    if matches!(source_kind, SourceKind::Automatic) {
+        scrub_auto_copy(repo, &staged, temporary.path(), source_commit)?;
+    }
     ensure_clean(&source)?;
     let after = git_at(&source, &["rev-parse", "HEAD"])?;
     if after.trim() != source_commit {
@@ -122,11 +224,63 @@ pub(super) fn prepare(
     {
         return Ok(SnapshotPlan::Checkout(error));
     }
+    if matches!(source_kind, SourceKind::Automatic)
+        && let Err(error) = ensure_auto_copy_clean(repo, &staged, temporary.path())
+    {
+        return Ok(SnapshotPlan::Checkout(error));
+    }
     Ok(SnapshotPlan::Prepared(PreparedSnapshot {
         temporary,
         source,
         target_commit: target_commit.to_owned(),
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn scrub_auto_copy(
+    repo: &Repository,
+    staged: &Path,
+    temporary: &Path,
+    source_commit: &str,
+) -> anyhow::Result<()> {
+    let index = temporary.join("snapshot-index");
+    staged_git(repo, staged, &index, &["read-tree", source_commit])?;
+    // Only dependency/build caches cross into a new branch. In particular,
+    // ignored credentials and unrelated untracked files stay in the source.
+    staged_git(
+        repo,
+        staged,
+        &index,
+        &[
+            "clean",
+            "-ffdx",
+            "-e",
+            "node_modules/",
+            "-e",
+            "target/",
+            "-e",
+            ".venv/",
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_auto_copy_clean(
+    repo: &Repository,
+    staged: &Path,
+    temporary: &Path,
+) -> anyhow::Result<()> {
+    let status = staged_git(
+        repo,
+        staged,
+        &temporary.join("snapshot-index"),
+        &["status", "--porcelain", "--untracked-files=normal"],
+    )?;
+    if !status.stdout.is_empty() {
+        bail!("Automatic snapshot has files outside the selected commit");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -138,27 +292,39 @@ fn reconcile_to_target(
     target_commit: &str,
 ) -> anyhow::Result<()> {
     let index = temporary.join("snapshot-index");
-    let run = |args: &[&str]| -> anyhow::Result<()> {
-        let output = Cmd::new("git")
-            .args(args.iter().copied())
-            .current_dir(staged)
-            .scrub_git_discovery_env()
-            .env("GIT_DIR", repo.git_common_dir())
-            .env("GIT_WORK_TREE", staged)
-            .env("GIT_INDEX_FILE", &index)
-            .run()?;
-        if !output.status.success() {
-            return Err(CommandError::from_failed_output("git", args, &output).into());
-        }
-        Ok(())
-    };
-    run(&["read-tree", source_commit])?;
-    run(&["update-index", "--refresh"])?;
-    run(&["read-tree", "-m", "-u", source_commit, target_commit])
-        .context("Cannot update snapshot files to the selected base commit")?;
-    run(&["diff-files", "--quiet"])
+    staged_git(repo, staged, &index, &["read-tree", source_commit])?;
+    staged_git(repo, staged, &index, &["update-index", "--refresh"])?;
+    staged_git(
+        repo,
+        staged,
+        &index,
+        &["read-tree", "-m", "-u", source_commit, target_commit],
+    )
+    .context("Cannot update snapshot files to the selected base commit")?;
+    staged_git(repo, staged, &index, &["diff-files", "--quiet"])
         .context("Snapshot files differ from the selected base commit")?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn staged_git(
+    repo: &Repository,
+    staged: &Path,
+    index: &Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    let output = Cmd::new("git")
+        .args(args.iter().copied())
+        .current_dir(staged)
+        .scrub_git_discovery_env()
+        .env("GIT_DIR", repo.git_common_dir())
+        .env("GIT_WORK_TREE", staged)
+        .env("GIT_INDEX_FILE", index)
+        .run()?;
+    if !output.status.success() {
+        return Err(CommandError::from_failed_output("git", args, &output).into());
+    }
+    Ok(output)
 }
 
 #[cfg(target_os = "macos")]

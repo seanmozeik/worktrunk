@@ -90,6 +90,297 @@ fn configure_snapshot_template_with_dependencies(repo: &TestRepo) -> PathBuf {
     template
 }
 
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_copies_dependency_caches_without_other_local_files(repo: TestRepo) {
+    fs::write(
+        repo.root_path().join(".gitignore"),
+        "node_modules/\ntarget/\n.venv/\n.env\n",
+    )
+    .unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore local files"]);
+    for (directory, file) in [
+        ("node_modules", "package.txt"),
+        ("target", "artifact.txt"),
+        (".venv", "package.txt"),
+    ] {
+        let cache = repo.root_path().join(directory);
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join(file), directory).unwrap();
+    }
+    fs::write(repo.root_path().join(".env"), "local secret\n").unwrap();
+    fs::write(repo.root_path().join("notes.txt"), "untracked note\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "auto-cache", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.auto-cache");
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/package.txt")).unwrap(),
+        "node_modules"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("target/artifact.txt")).unwrap(),
+        "target"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join(".venv/package.txt")).unwrap(),
+        ".venv"
+    );
+    assert!(!worktree.join(".env").exists());
+    assert!(!worktree.join("notes.txt").exists());
+    assert_eq!(
+        worktrunk::git::Repository::at(&worktree)
+            .unwrap()
+            .run_command(&["status", "--porcelain"])
+            .unwrap(),
+        ""
+    );
+    fs::write(worktree.join("node_modules/package.txt"), "local copy").unwrap();
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("node_modules/package.txt")).unwrap(),
+        "node_modules"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_uses_clean_linked_worktree_when_main_is_dirty(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    let seed = repo.home_path().join("repo.seed");
+    repo.run_git(&["worktree", "add", "-b", "seed", seed.to_str().unwrap()]);
+    fs::create_dir(seed.join("node_modules")).unwrap();
+    fs::write(seed.join("node_modules/package.txt"), "seeded").unwrap();
+    fs::write(repo.root_path().join("file.txt"), "dirty main\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "linked-source", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.linked-source");
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/package.txt")).unwrap(),
+        "seeded"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.root_path().join("file.txt")).unwrap(),
+        "dirty main\n"
+    );
+    assert_eq!(
+        worktrunk::git::Repository::at(&worktree)
+            .unwrap()
+            .run_command(&["status", "--porcelain"])
+            .unwrap(),
+        ""
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_updates_stale_source_to_selected_head(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    let seed = repo.home_path().join("repo.seed");
+    repo.run_git(&["worktree", "add", "-b", "seed", seed.to_str().unwrap()]);
+    fs::create_dir(seed.join("node_modules")).unwrap();
+    fs::write(seed.join("node_modules/package.txt"), "seeded").unwrap();
+    repo.commit("New main head");
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "from-stale", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.from-stale");
+    assert_eq!(
+        fs::read_to_string(worktree.join("file.txt")).unwrap(),
+        "New main head"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/package.txt")).unwrap(),
+        "seeded"
+    );
+    assert_eq!(
+        worktrunk::git::Repository::at(&worktree)
+            .unwrap()
+            .run_command(&["status", "--porcelain"])
+            .unwrap(),
+        ""
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_uses_sibling_template_after_worktrees_are_removed(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    let template = repo.home_path().join(".wt-templates/repo");
+    fs::create_dir(template.parent().unwrap()).unwrap();
+    repo.run_git(&[
+        "clone",
+        "--",
+        repo.root_path().to_str().unwrap(),
+        template.to_str().unwrap(),
+    ]);
+    fs::create_dir(template.join("node_modules")).unwrap();
+    fs::write(template.join("node_modules/package.txt"), "template").unwrap();
+    fs::write(repo.root_path().join("file.txt"), "dirty main\n").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "from-template", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            repo.home_path()
+                .join("repo.from-template/node_modules/package.txt")
+        )
+        .unwrap(),
+        "template"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_prefers_exact_head_over_stale_template(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    let template = repo.home_path().join(".wt-templates/repo");
+    fs::create_dir(template.parent().unwrap()).unwrap();
+    repo.run_git(&[
+        "clone",
+        "--",
+        repo.root_path().to_str().unwrap(),
+        template.to_str().unwrap(),
+    ]);
+    fs::create_dir(template.join("node_modules")).unwrap();
+    fs::write(template.join("node_modules/package.txt"), "stale template").unwrap();
+    repo.commit("New main head");
+    let seed = repo.home_path().join("repo.seed");
+    repo.run_git(&["worktree", "add", "-b", "seed", seed.to_str().unwrap()]);
+    fs::create_dir(seed.join("node_modules")).unwrap();
+    fs::write(seed.join("node_modules/package.txt"), "exact worktree").unwrap();
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "preferred", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.preferred");
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/package.txt")).unwrap(),
+        "exact worktree"
+    );
+    assert_eq!(
+        fs::read_to_string(worktree.join("file.txt")).unwrap(),
+        "New main head"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_can_be_disabled(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    fs::create_dir(repo.root_path().join("node_modules")).unwrap();
+    fs::write(repo.root_path().join("node_modules/package.txt"), "seeded").unwrap();
+    repo.write_test_config("[switch]\nsnapshot = false\n");
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "no-snapshot", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !repo
+            .home_path()
+            .join("repo.no-snapshot/node_modules")
+            .exists()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_auto_snapshot_falls_back_when_target_no_longer_ignores_cache(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+    fs::create_dir(repo.root_path().join("node_modules")).unwrap();
+    fs::write(repo.root_path().join("node_modules/package.txt"), "seeded").unwrap();
+    repo.run_git(&["switch", "-c", "no-ignore"]);
+    repo.run_git(&["rm", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Track dependencies differently"]);
+    repo.run_git(&["switch", "main"]);
+
+    let output = repo
+        .wt_command()
+        .args([
+            "switch",
+            "--create",
+            "target-no-ignore",
+            "--base",
+            "no-ignore",
+            "--no-cd",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.target-no-ignore");
+    assert!(!worktree.join("node_modules").exists());
+    assert_eq!(
+        worktrunk::git::Repository::at(&worktree)
+            .unwrap()
+            .run_command(&["status", "--porcelain"])
+            .unwrap(),
+        ""
+    );
+}
+
 /// A clean standalone checkout provides ignored files while Git still owns
 /// the new branch, index, and linked-worktree registration.
 #[cfg(target_os = "macos")]

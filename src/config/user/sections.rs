@@ -439,6 +439,11 @@ pub struct SwitchConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cd: Option<bool>,
 
+    /// Use APFS copies of an existing worktree when creating a worktree
+    /// (default: true on macOS; false disables automatic and explicit copies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<bool>,
+
     /// Clean standalone checkout to clone on APFS when creating a worktree.
     /// Tracked files are updated to the selected branch or base commit.
     /// Includes ignored files, so use a dedicated template without secrets.
@@ -455,12 +460,17 @@ impl SwitchConfig {
     pub fn cd(&self) -> bool {
         self.cd.unwrap_or(true)
     }
+
+    pub fn snapshot(&self) -> bool {
+        self.snapshot.unwrap_or(true)
+    }
 }
 
 impl Merge for SwitchConfig {
     fn merge_with(&self, other: &Self) -> Self {
         Self {
             cd: other.cd.or(self.cd),
+            snapshot: other.snapshot.or(self.snapshot),
             snapshot_from: other
                 .snapshot_from
                 .clone()
