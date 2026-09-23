@@ -326,7 +326,7 @@ On macOS with APFS, this fork can clone a prepared standalone checkout when `wt 
 snapshot-from = "/absolute/path/to/clean-juno-template"
 ```
 
-The template must have a `.git` directory and no tracked changes. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. When the requested base differs from the template commit, Worktrunk uses a normal Git checkout. Existing branches and worktrees use the usual path. The new worktree remains linked to the shared Git repository.
+The template must have a `.git` directory, no tracked changes, and no submodules. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. When the requested base differs from the template commit, Worktrunk warns and uses a normal Git checkout. Existing branches and worktrees use the usual path. The new worktree remains linked to the shared Git repository. A failed snapshot keeps the new worktree for inspection if Git has already registered it.
 
 For pnpm projects, run a blocking `pre-start` install after the snapshot. pnpm executable wrappers can contain absolute paths back to the template:
 
