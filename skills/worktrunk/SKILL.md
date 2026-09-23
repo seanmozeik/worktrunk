@@ -59,6 +59,14 @@ If no source works, `wt` uses a normal Git checkout. Configured hooks run in eit
 
 Agents must create worktrees through `wt` to use this optimization. Direct Git commands and agent hosts that create their own worktrees bypass it.
 
+### Preparing project for a new worktree
+
+For a new project branch based on main, fetch `origin` first. Prefer an existing clean checkout of `main` as the copy source. Inspect its status and fast-forward it to `origin/main` only when that preserves local work. Do not reset, stash, or switch a busy checkout just to prepare a source. If main is dirty or has diverged, leave it alone; another clean installed worktree can supply the copy, even at an older commit.
+
+Check that the source has dependencies installed for its current checkout. When they are missing or need an update, use project's pinned toolchain and run `pnpm install --frozen-lockfile --prefer-offline` there before creation. Reuse an already prepared checkout across new worktrees. No separate template is needed.
+
+Create the new branch with `wt switch --create <branch> --base origin/main` so it starts at the fetched main commit even if local main could not advance. An explicit user-selected base takes precedence. Let project's personal blocking `pre-start` hook finish the install in the new worktree; it repairs copied pnpm paths. If no suitable source is available, use normal creation and that hook rather than modifying someone's active work.
+
 ## Core workflows
 
 ### Setting up commit message generation (user config)

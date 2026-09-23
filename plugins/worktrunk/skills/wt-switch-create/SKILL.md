@@ -39,12 +39,14 @@ branch-shaped lead — all task).
 
 ## What to do
 
-Creating the worktree comes first on every invocation, before any other work.
+Creating the worktree, including source preparation below, comes first on every invocation, before task work.
 The invocation is itself the explicit request to create it; a research or
 read-only task gets one all the same.
 
 <!-- Maintainers: rationale.md (same directory) covers the harness rules and
 design choices behind this — read it before re-adding guards or routes. -->
+
+For project, first follow [Preparing project for a new worktree](../worktrunk/SKILL.md#preparing-project-for-a-new-worktree): fetch main and prefer a clean, current checkout with installed dependencies. Preserve active work. Use step 3 with `--base origin/main` when creating from fetched main; this makes the base explicit instead of relying on the hook's default. Preserve any base the user explicitly selected.
 
 1. **Pick the branch name** if none was given: short, from the task and
    consistent with existing worktree names, or, mid-session, from the work
@@ -60,14 +62,16 @@ design choices behind this — read it before re-adding guards or routes. -->
    `EnterWorktree` call, then `git stash pop` after — the call re-roots the
    session into the new worktree, and the stash is shared across worktrees.
 
-3. **Otherwise create it with `wt` and enter by path.** Two cases reach here: a
-   repo argument, which step 2 can't target, and a failed step 2, whose error
-   says which — `✗ Branch <branch> already exists`, or `Already in a worktree
+3. **Otherwise create it with `wt` and enter by path.** Use this route for an
+   explicit base, a repo argument (which step 2 can't target), or a failed
+   step 2, whose error says which — `✗ Branch <branch> already exists`, or `Already in a worktree
    session`. Create with a `Bash` call (omit `-C <repo>` for this repo):
 
    ```
    wt -C <repo> switch --create <branch> --no-cd --format=json
    ```
+
+   Add `--base <ref>` when a base was selected above.
 
    Stdout is JSON whose `path` field is the worktree's absolute path (status
    lines go to stderr). On `Branch <branch> already exists`: if the user named
