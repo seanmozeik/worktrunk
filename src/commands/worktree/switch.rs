@@ -1075,6 +1075,31 @@ fn execute_switch(
                     base_branch,
                     base_pr_upstream,
                 } => {
+                    let snapshot_source = config
+                        .resolved(repo.project_identifier().ok().as_deref())
+                        .switch
+                        .snapshot_from;
+                    #[cfg(target_os = "macos")]
+                    let prepared_snapshot = if *create_branch {
+                        snapshot_source
+                            .as_deref()
+                            .map(|source| {
+                                super::snapshot::prepare(
+                                    repo,
+                                    source,
+                                    base_branch.as_deref(),
+                                    &worktree_path,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    #[cfg(not(target_os = "macos"))]
+                    if snapshot_source.is_some() && *create_branch {
+                        bail!("switch.snapshot-from requires macOS APFS");
+                    }
                     // Check if local branch exists BEFORE git worktree add (for DWIM detection)
                     let branch_handle = repo.branch(&branch);
                     let local_branch_existed =
@@ -1119,6 +1144,10 @@ fn execute_switch(
                     args.extend(["-c", "branch.autoSetupMerge=simple"]);
 
                     args.extend(["worktree", "add"]);
+                    #[cfg(target_os = "macos")]
+                    if prepared_snapshot.is_some() {
+                        args.push("--no-checkout");
+                    }
 
                     // For DWIM fallback: when the branch doesn't exist locally,
                     // git worktree add relies on DWIM to auto-create it from a
@@ -1187,6 +1216,11 @@ fn execute_switch(
                             leftover,
                         )
                         .into());
+                    }
+
+                    #[cfg(target_os = "macos")]
+                    if let Some(snapshot) = prepared_snapshot {
+                        snapshot.install(&worktree_path)?;
                     }
 
                     // `--base pr:N` / `--base mr:N` against a same-repo PR/MR: the

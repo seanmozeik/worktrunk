@@ -84,6 +84,8 @@ mod finish;
 pub(crate) mod hooks;
 mod push;
 mod resolve;
+#[cfg(target_os = "macos")]
+mod snapshot;
 mod switch;
 mod types;
 
