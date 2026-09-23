@@ -1079,46 +1079,9 @@ fn execute_switch(
         } => {
             // Validate and stage the copy before --clobber can move an
             // existing path or Git can create the new branch.
-            let switch_config = config.switch(repo.project_identifier().ok().as_deref());
-            let snapshot_source = switch_config.snapshot_from.as_deref();
             #[cfg(target_os = "macos")]
-            let snapshot_plan = if switch_config.snapshot() {
-                if let Some(base) = snapshot_base_ref(repo, &branch, &method)? {
-                    if let Some(source) = snapshot_source {
-                        Some(super::snapshot::prepare(
-                            repo,
-                            source,
-                            &base,
-                            &worktree_path,
-                        )?)
-                    } else {
-                        super::snapshot::prepare_auto(repo, &base, &worktree_path)
-                            .map(super::snapshot::SnapshotPlan::Prepared)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            #[cfg(target_os = "macos")]
-            let prepared_snapshot = match snapshot_plan {
-                Some(super::snapshot::SnapshotPlan::Prepared(snapshot)) => Some(snapshot),
-                Some(super::snapshot::SnapshotPlan::Checkout(error)) => {
-                    eprintln!(
-                        "{}",
-                        warning_message(format!(
-                            "Cannot use APFS snapshot ({error:#}); using a normal Git checkout"
-                        ))
-                    );
-                    None
-                }
-                None => None,
-            };
-            #[cfg(not(target_os = "macos"))]
-            if snapshot_source.is_some() && matches!(&method, CreationMethod::Regular { .. }) {
-                bail!("switch.snapshot-from requires macOS APFS");
-            }
+            let prepared_snapshot = snapshot_base_ref(repo, &branch, &method)?
+                .and_then(|base| super::snapshot::prepare(repo, &base, &worktree_path));
 
             // Handle --clobber backup if needed (shared for all creation methods)
             if needs_clobber_backup {

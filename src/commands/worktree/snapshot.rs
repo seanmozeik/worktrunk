@@ -1,7 +1,7 @@
 //! APFS directory snapshots for new linked worktrees.
 //!
 //! This keeps Git worktree metadata and Worktrunk's lifecycle intact. Only the
-//! working files come from the template; Git still owns the branch and index.
+//! working files come from an existing worktree; Git still owns the branch and index.
 
 use std::fs;
 use std::io::Write;
@@ -18,73 +18,35 @@ pub(super) struct PreparedSnapshot {
     target_commit: String,
 }
 
+/// Stage a copy of an existing worktree before Git creates the new worktree.
+/// An unavailable copy is an optimization miss; the caller uses Git checkout.
 #[cfg(target_os = "macos")]
-pub(super) enum SnapshotPlan {
-    Prepared(PreparedSnapshot),
-    Checkout(anyhow::Error),
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-enum SourceKind {
-    Configured,
-    Automatic,
-}
-
-/// Find a reusable checkout without requiring a per-project template path.
-/// Existing worktrees provide their local dependency caches; a prepared
-/// standalone template beside the repository remains useful after worktrees
-/// are removed.
-#[cfg(target_os = "macos")]
-pub(super) fn prepare_auto(
+pub(super) fn prepare(
     repo: &Repository,
     target_ref: &str,
     destination: &Path,
 ) -> Option<PreparedSnapshot> {
     let target_commit = resolve_commit(repo, target_ref).ok()?;
-    let template = repo.home_path().ok().and_then(|home| {
-        home.parent()
-            .zip(home.file_name())
-            .map(|(parent, name)| parent.join(".wt-templates").join(name))
-    });
-    let mut exact = Vec::new();
-    let mut older = Vec::new();
-    if let Ok(worktrees) = repo.list_worktrees() {
-        for worktree in worktrees
-            .iter()
-            .filter(|worktree| !worktree.is_prunable() && worktree.path.is_dir())
-        {
-            if worktree.head == target_commit {
-                exact.push(worktree.path.clone());
-            } else {
-                older.push(worktree.path.clone());
-            }
-        }
-    }
+    let mut candidates: Vec<_> = repo
+        .list_worktrees()
+        .ok()?
+        .iter()
+        .filter(|worktree| !worktree.is_prunable() && has_dependency_cache(&worktree.path))
+        .collect();
     // Linked worktrees have a small .git pointer. The primary checkout can
     // carry a large Git database that would be copied only to be removed.
-    exact.sort_by_key(|path| !path.join(".git").is_file());
-    older.sort_by_key(|path| !path.join(".git").is_file());
-    let mut candidates = exact;
-    if let Some(template) = template.filter(|path| path.is_dir()) {
-        candidates.push(template);
-    }
-    candidates.extend(older);
+    candidates.sort_by_key(|worktree| {
+        (
+            worktree.head != target_commit,
+            !worktree.path.join(".git").is_file(),
+        )
+    });
 
     for candidate in candidates {
-        if !has_dependency_cache(&candidate) {
-            continue;
-        }
-        match prepare_source(
-            repo,
-            &candidate,
-            &target_commit,
-            destination,
-            SourceKind::Automatic,
-        ) {
-            Ok(SnapshotPlan::Prepared(snapshot)) => return Some(snapshot),
-            Ok(SnapshotPlan::Checkout(error)) | Err(error) => {
-                log::debug!("Cannot snapshot {}: {error:#}", candidate.display());
+        match prepare_source(repo, &candidate.path, &target_commit, destination) {
+            Ok(snapshot) => return Some(snapshot),
+            Err(error) => {
+                log::debug!("Cannot snapshot {}: {error:#}", candidate.path.display());
             }
         }
     }
@@ -98,24 +60,6 @@ fn has_dependency_cache(source: &Path) -> bool {
     })
 }
 
-/// Prepare the selected commit before `git worktree add` creates a worktree.
-#[cfg(target_os = "macos")]
-pub(super) fn prepare(
-    repo: &Repository,
-    configured_source: &Path,
-    target_ref: &str,
-    destination: &Path,
-) -> anyhow::Result<SnapshotPlan> {
-    let target_commit = resolve_commit(repo, target_ref)?;
-    prepare_source(
-        repo,
-        configured_source,
-        &target_commit,
-        destination,
-        SourceKind::Configured,
-    )
-}
-
 #[cfg(target_os = "macos")]
 fn resolve_commit(repo: &Repository, target_ref: &str) -> anyhow::Result<String> {
     let commit = format!("{target_ref}^{{commit}}");
@@ -126,27 +70,13 @@ fn resolve_commit(repo: &Repository, target_ref: &str) -> anyhow::Result<String>
 #[cfg(target_os = "macos")]
 fn prepare_source(
     repo: &Repository,
-    configured_source: &Path,
+    source: &Path,
     target_commit: &str,
     destination: &Path,
-    source_kind: SourceKind,
-) -> anyhow::Result<SnapshotPlan> {
-    if !configured_source.is_absolute() {
-        bail!("switch.snapshot-from must be an absolute path");
-    }
-    let source = dunce::canonicalize(configured_source).with_context(|| {
-        format!(
-            "Cannot read snapshot template {}",
-            configured_source.display()
-        )
-    })?;
+) -> anyhow::Result<PreparedSnapshot> {
+    let source = dunce::canonicalize(source)
+        .with_context(|| format!("Cannot read snapshot source {}", source.display()))?;
     let git_metadata = fs::symlink_metadata(source.join(".git"))?;
-    if matches!(source_kind, SourceKind::Configured) && !git_metadata.file_type().is_dir() {
-        bail!(
-            "Snapshot template must be a standalone Git checkout: {}",
-            source.display()
-        );
-    }
     if !git_metadata.file_type().is_dir() && !git_metadata.file_type().is_file() {
         bail!("Snapshot source has no Git metadata: {}", source.display());
     }
@@ -154,7 +84,7 @@ fn prepare_source(
     let source_root = dunce::canonicalize(source_root)?;
     if source_root != source {
         bail!(
-            "Snapshot template must name the checkout root: {}",
+            "Snapshot source must name the checkout root: {}",
             source.display()
         );
     }
@@ -166,19 +96,12 @@ fn prepare_source(
         .split('\0')
         .any(|entry| entry.starts_with("160000 "))
     {
-        bail!("Snapshot template has submodules: {}", source.display());
+        bail!("Snapshot source has submodules: {}", source.display());
     }
 
     let destination_resolved = worktrunk::path::canonicalize_with_parents(destination);
     if destination_resolved.starts_with(&source) || source.starts_with(&destination_resolved) {
-        bail!("Snapshot template and new worktree paths must not contain each other");
-    }
-    if let Err(error) =
-        repo.run_command(&["cat-file", "-e", &format!("{source_commit}^{{commit}}")])
-    {
-        return Ok(SnapshotPlan::Checkout(
-            error.context("Template commit is absent from the target repository"),
-        ));
+        bail!("Snapshot source and new worktree paths must not contain each other");
     }
 
     let parent = destination
@@ -202,38 +125,30 @@ fn prepare_source(
     } else {
         fs::remove_file(staged.join(".git"))?;
     }
-    if matches!(source_kind, SourceKind::Automatic) {
-        scrub_auto_copy(repo, &staged, temporary.path(), source_commit)?;
-    }
+    scrub_auto_copy(repo, &staged, temporary.path(), source_commit)?;
     ensure_clean(&source)?;
     let after = git_at(&source, &["rev-parse", "HEAD"])?;
     if after.trim() != source_commit {
         bail!(
-            "Snapshot template changed while it was copied: {}",
+            "Snapshot source changed while it was copied: {}",
             source.display()
         );
     }
-    if source_commit != target_commit
-        && let Err(error) = reconcile_to_target(
+    if source_commit != target_commit {
+        reconcile_to_target(
             repo,
             &staged,
             temporary.path(),
             source_commit,
             target_commit,
-        )
-    {
-        return Ok(SnapshotPlan::Checkout(error));
+        )?;
     }
-    if matches!(source_kind, SourceKind::Automatic)
-        && let Err(error) = ensure_auto_copy_clean(repo, &staged, temporary.path())
-    {
-        return Ok(SnapshotPlan::Checkout(error));
-    }
-    Ok(SnapshotPlan::Prepared(PreparedSnapshot {
+    ensure_auto_copy_clean(repo, &staged, temporary.path(), target_commit)?;
+    Ok(PreparedSnapshot {
         temporary,
         source,
         target_commit: target_commit.to_owned(),
-    }))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -270,14 +185,24 @@ fn ensure_auto_copy_clean(
     repo: &Repository,
     staged: &Path,
     temporary: &Path,
+    target_commit: &str,
 ) -> anyhow::Result<()> {
-    let status = staged_git(
+    let index = temporary.join("snapshot-index");
+    // The shared Git directory's HEAD can name a different branch. Compare
+    // against the requested commit, not that checkout's HEAD.
+    staged_git(
         repo,
         staged,
-        &temporary.join("snapshot-index"),
-        &["status", "--porcelain", "--untracked-files=normal"],
+        &index,
+        &["diff", "--quiet", target_commit, "--"],
     )?;
-    if !status.stdout.is_empty() {
+    let untracked = staged_git(
+        repo,
+        staged,
+        &index,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    if !untracked.stdout.is_empty() {
         bail!("Automatic snapshot has files outside the selected commit");
     }
     Ok(())
@@ -331,10 +256,7 @@ fn staged_git(
 fn ensure_clean(source: &Path) -> anyhow::Result<()> {
     let status = git_at(source, &["status", "--porcelain", "--untracked-files=no"])?;
     if !status.trim().is_empty() {
-        bail!(
-            "Snapshot template has tracked changes: {}",
-            source.display()
-        );
+        bail!("Snapshot source has tracked changes: {}", source.display());
     }
     Ok(())
 }

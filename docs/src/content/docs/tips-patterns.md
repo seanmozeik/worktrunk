@@ -319,26 +319,23 @@ All gitignored files are copied by default. To limit what gets copied, create `.
 
 #### Automatic APFS worktree copies
 
-On macOS with APFS, `wt switch` reuses a clean worktree that has `node_modules/`, `target/`, or `.venv/`. It also checks `.wt-templates/<repo-name>/` beside the primary worktree, so a prepared template can remain after other worktrees are removed. No snapshot setting is needed. Git still creates the branch and linked worktree. Worktrunk copies the source directory, removes unrelated ignored and untracked files, and updates tracked files to the selected branch head or base commit. A source at an older commit is valid. If no suitable source works, creation uses a normal Git checkout.
+On macOS with APFS, this fork makes new worktrees with copy-on-write files when an existing registered worktree has no tracked changes and has a root `node_modules/`, `target/`, or `.venv/` directory. These copies share disk blocks until their contents change. Editing a copied file does not change the source file.
 
-The copy keeps the recognized cache directories and removes other ignored and untracked paths, such as a root `.env` or scratch file. Keep secrets out of dependency and build caches. Package managers may still need to update copied paths and packages. Use a blocking `pre-start` hook for pnpm or Bun when the new worktree must be ready before an agent starts:
+Use normal `wt switch` commands. Git still controls the branch, index, and linked-worktree registration. Worktrunk prefers sources at the selected commit, and prefers linked worktrees over the primary checkout at the same commit. An older source also works: Git updates the copied tracked files to the selected branch head or base commit. Branch selection and fetch behavior stay the same as normal Worktrunk.
+
+The copy keeps dependency and build caches and removes other ignored and untracked paths, such as a root `.env` or scratch file. Files inside the cache directories are copied too. If no source can be used, or the filesystem does not support the copy, Worktrunk uses a normal Git checkout. Configured hooks run in either case. There are no template directories or copy settings to maintain.
+
+Package managers may need to update copied paths and packages. Use a normal blocking `pre-start` hook when dependencies must be ready before an agent starts. A personal project override can live in the Worktrunk user config; it requires no file in the project:
 
 ```toml
-# .config/wt.toml in a pnpm project
-[pre-start]
+# ~/.config/worktrunk/config.toml
+[projects."github.com/example/project".pre-start]
 install = "pnpm install --frozen-lockfile --prefer-offline"
 ```
 
-For a Bun project, use `bun install --frozen-lockfile` in the same hook. Cargo checks copied `target/` artifacts when the next build runs. Worktrunk's normal hook approval rules apply to project hooks.
+For a Bun project, use its project key and `bun install --frozen-lockfile`. Cargo checks copied `target/` artifacts when the next build runs. A new project with no installed cache still needs its usual dependency install. Worktrunk does not choose or run an installer automatically.
 
-To disable automatic copies for a project, set `snapshot = false` in its personal Worktrunk override. `snapshot-from` remains available when a dedicated source is better than the available worktrees:
-
-```toml
-[projects."github.com/example/project".switch]
-snapshot-from = "/absolute/path/to/clean-template"
-```
-
-An explicit template must be a clean standalone Git checkout without submodules. It copies all ignored and untracked files, so keep secrets and unrelated output out of that template. Existing worktrees only switch directories; the snapshot path runs when Worktrunk creates a linked worktree.
+This behavior is the same for people and agents that create worktrees through `wt`. A direct `git worktree add` command or an agent host's own worktree creation does not use this copy path. Switching to an existing worktree does not copy files.
 
 ### Subdomain routing with Caddy
 

@@ -64,30 +64,21 @@ fn test_switch_create_new_branch(repo: TestRepo) {
 }
 
 #[cfg(target_os = "macos")]
-fn configure_snapshot_template(repo: &TestRepo) -> PathBuf {
-    let template = repo.home_path().join("template");
-    repo.run_git(&[
-        "clone",
-        "--",
-        repo.root_path().to_str().unwrap(),
-        template.to_str().unwrap(),
-    ]);
-    repo.write_test_config(&format!(
-        "[switch]\nsnapshot-from = {:?}\n",
-        template.to_str().unwrap()
-    ));
-    template
-}
-
-#[cfg(target_os = "macos")]
-fn configure_snapshot_template_with_dependencies(repo: &TestRepo) -> PathBuf {
+fn add_cached_source(repo: &TestRepo) -> PathBuf {
     fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
     repo.run_git(&["add", ".gitignore"]);
     repo.run_git(&["commit", "-m", "Ignore dependencies"]);
-    let template = configure_snapshot_template(repo);
-    fs::create_dir(template.join("node_modules")).unwrap();
-    fs::write(template.join("node_modules/cache.txt"), "shared\n").unwrap();
-    template
+    let source = repo.home_path().join("repo.cache-source");
+    repo.run_git(&[
+        "worktree",
+        "add",
+        "-b",
+        "cache-source",
+        source.to_str().unwrap(),
+    ]);
+    fs::create_dir(source.join("node_modules")).unwrap();
+    fs::write(source.join("node_modules/cache.txt"), "shared\n").unwrap();
+    source
 }
 
 #[cfg(target_os = "macos")]
@@ -233,58 +224,14 @@ fn test_switch_auto_snapshot_updates_stale_source_to_selected_head(repo: TestRep
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_auto_snapshot_uses_sibling_template_after_worktrees_are_removed(repo: TestRepo) {
+fn test_switch_auto_snapshot_prefers_exact_head_over_stale_worktree(repo: TestRepo) {
     fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
     repo.run_git(&["add", ".gitignore"]);
     repo.run_git(&["commit", "-m", "Ignore dependencies"]);
-    let template = repo.home_path().join(".wt-templates/repo");
-    fs::create_dir(template.parent().unwrap()).unwrap();
-    repo.run_git(&[
-        "clone",
-        "--",
-        repo.root_path().to_str().unwrap(),
-        template.to_str().unwrap(),
-    ]);
-    fs::create_dir(template.join("node_modules")).unwrap();
-    fs::write(template.join("node_modules/package.txt"), "template").unwrap();
-    fs::write(repo.root_path().join("file.txt"), "dirty main\n").unwrap();
-
-    let output = repo
-        .wt_command()
-        .args(["switch", "--create", "from-template", "--no-cd"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        fs::read_to_string(
-            repo.home_path()
-                .join("repo.from-template/node_modules/package.txt")
-        )
-        .unwrap(),
-        "template"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
-fn test_switch_auto_snapshot_prefers_exact_head_over_stale_template(repo: TestRepo) {
-    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
-    repo.run_git(&["add", ".gitignore"]);
-    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
-    let template = repo.home_path().join(".wt-templates/repo");
-    fs::create_dir(template.parent().unwrap()).unwrap();
-    repo.run_git(&[
-        "clone",
-        "--",
-        repo.root_path().to_str().unwrap(),
-        template.to_str().unwrap(),
-    ]);
-    fs::create_dir(template.join("node_modules")).unwrap();
-    fs::write(template.join("node_modules/package.txt"), "stale template").unwrap();
+    let source = repo.home_path().join("repo.stale");
+    repo.run_git(&["worktree", "add", "-b", "stale", source.to_str().unwrap()]);
+    fs::create_dir(source.join("node_modules")).unwrap();
+    fs::write(source.join("node_modules/package.txt"), "stale worktree").unwrap();
     repo.commit("New main head");
     let seed = repo.home_path().join("repo.seed");
     repo.run_git(&["worktree", "add", "-b", "seed", seed.to_str().unwrap()]);
@@ -309,34 +256,6 @@ fn test_switch_auto_snapshot_prefers_exact_head_over_stale_template(repo: TestRe
     assert_eq!(
         fs::read_to_string(worktree.join("file.txt")).unwrap(),
         "New main head"
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
-fn test_switch_auto_snapshot_can_be_disabled(repo: TestRepo) {
-    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
-    repo.run_git(&["add", ".gitignore"]);
-    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
-    fs::create_dir(repo.root_path().join("node_modules")).unwrap();
-    fs::write(repo.root_path().join("node_modules/package.txt"), "seeded").unwrap();
-    repo.write_test_config("[switch]\nsnapshot = false\n");
-
-    let output = repo
-        .wt_command()
-        .args(["switch", "--create", "no-snapshot", "--no-cd"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        !repo
-            .home_path()
-            .join("repo.no-snapshot/node_modules")
-            .exists()
     );
 }
 
@@ -381,12 +300,12 @@ fn test_switch_auto_snapshot_falls_back_when_target_no_longer_ignores_cache(repo
     );
 }
 
-/// A clean standalone checkout provides ignored files while Git still owns
+/// A clean linked checkout provides cached files while Git still owns
 /// the new branch, index, and linked-worktree registration.
 #[cfg(target_os = "macos")]
 #[rstest]
 fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
-    let template = configure_snapshot_template_with_dependencies(&repo);
+    let source = add_cached_source(&repo);
 
     let output = repo
         .wt_command()
@@ -409,12 +328,7 @@ fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
     assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
     fs::write(worktree.join("node_modules/cache.txt"), "local\n").unwrap();
     assert_eq!(
-        fs::read_to_string(template.join("node_modules/cache.txt")).unwrap(),
-        "shared\n"
-    );
-    fs::write(worktree.join("node_modules/cache.txt"), "local\n").unwrap();
-    assert_eq!(
-        fs::read_to_string(template.join("node_modules/cache.txt")).unwrap(),
+        fs::read_to_string(source.join("node_modules/cache.txt")).unwrap(),
         "shared\n"
     );
 
@@ -433,86 +347,8 @@ fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_snapshot_rejects_dirty_template(repo: TestRepo) {
-    let template = configure_snapshot_template(&repo);
-    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
-    let rejected = repo
-        .wt_command()
-        .args(["switch", "--create", "must-not-exist", "--no-cd"])
-        .output()
-        .unwrap();
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("tracked changes"),
-        "{}",
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    assert!(
-        repo.repo
-            .worktree_for_branch("must-not-exist")
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
-fn test_switch_snapshot_uses_git_checkout_when_template_commit_is_absent(repo: TestRepo) {
-    let unrelated = TestRepo::with_initial_commit();
-    unrelated.commit("Unrelated template commit");
-    repo.write_test_config(&format!(
-        "[switch]\nsnapshot-from = {:?}\n",
-        unrelated.root_path().to_str().unwrap()
-    ));
-
-    let output = repo
-        .wt_command()
-        .args(["switch", "--create", "from-git", "--no-cd"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("normal Git checkout"));
-    let worktree = repo.home_path().join("repo.from-git");
-    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
-    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
-fn test_switch_snapshot_updates_tracked_files_to_new_base(repo: TestRepo) {
-    configure_snapshot_template_with_dependencies(&repo);
-    repo.commit("New base commit");
-    let output = repo
-        .wt_command()
-        .args(["switch", "--create", "new-base", "--no-cd"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let worktree = repo.home_path().join("repo.new-base");
-    assert_eq!(
-        fs::read_to_string(worktree.join("file.txt")).unwrap(),
-        "New base commit"
-    );
-    assert_eq!(
-        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
-        "shared\n"
-    );
-    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
-    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
 fn test_switch_snapshot_uses_selected_branch_head(repo: TestRepo) {
-    configure_snapshot_template_with_dependencies(&repo);
+    add_cached_source(&repo);
 
     repo.run_git(&["switch", "-c", "release"]);
     repo.run_git(&["rm", "file.txt"]);
@@ -565,7 +401,7 @@ fn test_switch_snapshot_uses_selected_branch_head(repo: TestRepo) {
 #[cfg(target_os = "macos")]
 #[rstest]
 fn test_switch_snapshot_creates_worktree_for_existing_local_branch(repo: TestRepo) {
-    configure_snapshot_template_with_dependencies(&repo);
+    add_cached_source(&repo);
     repo.commit("New branch head");
     repo.run_git(&["branch", "existing"]);
 
@@ -597,7 +433,7 @@ fn test_switch_snapshot_creates_worktree_for_existing_local_branch(repo: TestRep
 fn test_switch_snapshot_creates_worktree_for_remote_branch(
     #[from(repo_with_remote)] repo: TestRepo,
 ) {
-    configure_snapshot_template_with_dependencies(&repo);
+    add_cached_source(&repo);
     repo.commit("New remote head");
     repo.run_git(&["branch", "remote-snapshot"]);
     repo.run_git(&["push", "origin", "remote-snapshot"]);
@@ -628,49 +464,34 @@ fn test_switch_snapshot_creates_worktree_for_remote_branch(
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_snapshot_checks_template_with_inherited_git_dir(repo: TestRepo) {
-    let template = configure_snapshot_template(&repo);
-    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
+fn test_switch_snapshot_skips_dirty_source_with_inherited_git_dir(repo: TestRepo) {
+    let source = add_cached_source(&repo);
+    fs::write(source.join("file.txt"), "dirty source\n").unwrap();
     let output = repo
         .wt_command()
         .env("GIT_DIR", repo.root_path().join(".git"))
         .env("GIT_WORK_TREE", repo.root_path())
-        .args(["switch", "--create", "must-not-exist", "--no-cd"])
+        .args(["switch", "--create", "from-git", "--no-cd"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("tracked changes"));
-}
-
-#[cfg(target_os = "macos")]
-#[rstest]
-fn test_switch_snapshot_checks_template_before_clobber(repo: TestRepo) {
-    let template = configure_snapshot_template(&repo);
-    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
-    let occupant = repo.home_path().join("repo.must-not-exist");
-    fs::create_dir(&occupant).unwrap();
-    fs::write(occupant.join("keep.txt"), "keep\n").unwrap();
-    let output = repo
-        .wt_command()
-        .args([
-            "switch",
-            "--create",
-            "must-not-exist",
-            "--clobber",
-            "--no-cd",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert_eq!(
-        fs::read_to_string(occupant.join("keep.txt")).unwrap(),
-        "keep\n"
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let worktree = repo.home_path().join("repo.from-git");
+    assert!(!worktree.join("node_modules").exists());
+    assert_eq!(
+        fs::read_to_string(source.join("file.txt")).unwrap(),
+        "dirty source\n"
+    );
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
 }
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_snapshot_rejects_submodules(repo: TestRepo) {
+fn test_switch_snapshot_falls_back_for_submodules(repo: TestRepo) {
     let head = repo
         .git_command()
         .args(["rev-parse", "HEAD"])
@@ -680,14 +501,27 @@ fn test_switch_snapshot_rejects_submodules(repo: TestRepo) {
     let gitlink = format!("160000,{},vendor/module", head.trim());
     repo.run_git(&["update-index", "--add", "--cacheinfo", &gitlink]);
     repo.run_git(&["commit", "-m", "Add gitlink"]);
-    let _template = configure_snapshot_template(&repo);
+    let _source = add_cached_source(&repo);
     let output = repo
         .wt_command()
-        .args(["switch", "--create", "must-not-exist", "--no-cd"])
+        .args(["switch", "--create", "from-git", "--no-cd"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("submodules"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.from-git");
+    assert!(!worktree.join("node_modules").exists());
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert!(
+        linked
+            .run_command(&["ls-files", "--stage", "vendor/module"])
+            .unwrap()
+            .starts_with("160000 ")
+    );
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
 }
 
 /// Test that delayed streaming shows progress message when threshold is 0.

@@ -53,9 +53,11 @@ Some requests span both: commit-message generation is user config, while the tea
 
 ## Automatic APFS copies in this fork
 
-On macOS, `wt switch --create` looks for a clean checkout with a root `node_modules/`, `target/`, or `.venv/` cache. It prefers a linked worktree at the selected commit, then a sibling `.wt-templates/<repo-name>/` checkout, then older worktrees. Git updates tracked files to the selected branch head or base commit. If no source works, `wt` uses a normal checkout. No snapshot setting is needed.
+Use normal `wt switch` commands. On macOS with APFS, new worktrees can reuse an existing registered worktree with no tracked changes and a root `node_modules/`, `target/`, or `.venv/` cache. The files share disk blocks until changed. Git updates tracked files to the selected branch head or base commit; the source need not be current. Other ignored and untracked files are removed from the copy. There are no template directories or copy settings.
 
-The automatic copy keeps those cache directories and removes other ignored and untracked files. Files inside the cache directories still cross into the new worktree. For pnpm or Bun, use a blocking `pre-start` install hook when the worktree must be ready before an agent starts; copied executable paths and packages may need repair. A personal hook belongs in user config and does not require a project commit. Read `reference/tips-patterns.md#automatic-apfs-worktree-copies` for the optional `snapshot = false` and `snapshot-from` settings.
+If no source works, `wt` uses a normal Git checkout. Configured hooks run in either case. For pnpm or Bun, use a normal blocking `pre-start` install hook when dependencies must be ready before an agent starts; copied executable paths and packages may need repair. Personal hooks belong in user config and require no project commit. See `reference/tips-patterns.md#automatic-apfs-worktree-copies`.
+
+Agents must create worktrees through `wt` to use this optimization. Direct Git commands and agent hosts that create their own worktrees bypass it.
 
 ## Core workflows
 
