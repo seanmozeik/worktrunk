@@ -46,7 +46,7 @@ read-only task gets one all the same.
 <!-- Maintainers: rationale.md (same directory) covers the harness rules and
 design choices behind this — read it before re-adding guards or routes. -->
 
-For project, first follow [Preparing project for a new worktree](../worktrunk/SKILL.md#preparing-project-for-a-new-worktree): fetch main and prefer a clean, current checkout with installed dependencies. Preserve active work. Use step 3 with `--base origin/main` when creating from fetched main; this makes the base explicit instead of relying on the hook's default. Preserve any base the user explicitly selected.
+Before creation, follow [Preparing a source for a new worktree](../worktrunk/SKILL.md#preparing-a-source-for-a-new-worktree). When the task calls for the latest default branch, prefer a clean, current checkout with installed dependencies. Use step 3 with `--base <remote>/<default-branch>` to select the fetched commit. Preserve any base the user explicitly selected.
 
 1. **Pick the branch name** if none was given: short, from the task and
    consistent with existing worktree names, or, mid-session, from the work
