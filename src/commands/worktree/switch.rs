@@ -1050,6 +1050,52 @@ fn execute_switch(
             needs_clobber_backup,
             new_previous,
         } => {
+            // Validate and stage the optional snapshot before --clobber can
+            // move an existing path or Git can create the new branch.
+            let snapshot_source = config
+                .switch(repo.project_identifier().ok().as_deref())
+                .snapshot_from;
+            #[cfg(target_os = "macos")]
+            let prepared_snapshot = match (&method, snapshot_source.as_deref()) {
+                (
+                    CreationMethod::Regular {
+                        create_branch: true,
+                        base_branch,
+                        ..
+                    },
+                    Some(source),
+                ) => {
+                    let prepared = super::snapshot::prepare(
+                        repo,
+                        source,
+                        base_branch.as_deref(),
+                        &worktree_path,
+                    )?;
+                    if prepared.is_none() {
+                        eprintln!(
+                            "{}",
+                            warning_message(
+                                "Snapshot template is at another commit; using a normal Git checkout"
+                            )
+                        );
+                    }
+                    prepared
+                }
+                _ => None,
+            };
+            #[cfg(not(target_os = "macos"))]
+            if snapshot_source.is_some()
+                && matches!(
+                    &method,
+                    CreationMethod::Regular {
+                        create_branch: true,
+                        ..
+                    }
+                )
+            {
+                bail!("switch.snapshot-from requires macOS APFS");
+            }
+
             // Handle --clobber backup if needed (shared for all creation methods)
             if needs_clobber_backup {
                 // Atomically move the stale path aside, to a timestamped backup
@@ -1075,31 +1121,6 @@ fn execute_switch(
                     base_branch,
                     base_pr_upstream,
                 } => {
-                    let snapshot_source = config
-                        .resolved(repo.project_identifier().ok().as_deref())
-                        .switch
-                        .snapshot_from;
-                    #[cfg(target_os = "macos")]
-                    let prepared_snapshot = if *create_branch {
-                        snapshot_source
-                            .as_deref()
-                            .map(|source| {
-                                super::snapshot::prepare(
-                                    repo,
-                                    source,
-                                    base_branch.as_deref(),
-                                    &worktree_path,
-                                )
-                            })
-                            .transpose()?
-                            .flatten()
-                    } else {
-                        None
-                    };
-                    #[cfg(not(target_os = "macos"))]
-                    if snapshot_source.is_some() && *create_branch {
-                        bail!("switch.snapshot-from requires macOS APFS");
-                    }
                     // Check if local branch exists BEFORE git worktree add (for DWIM detection)
                     let branch_handle = repo.branch(&branch);
                     let local_branch_existed =
@@ -1220,7 +1241,7 @@ fn execute_switch(
 
                     #[cfg(target_os = "macos")]
                     if let Some(snapshot) = prepared_snapshot {
-                        snapshot.install(&worktree_path)?;
+                        snapshot.install(repo, &worktree_path)?;
                     }
 
                     // `--base pr:N` / `--base mr:N` against a same-repo PR/MR: the

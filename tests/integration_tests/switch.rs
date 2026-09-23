@@ -63,6 +63,22 @@ fn test_switch_create_new_branch(repo: TestRepo) {
     snapshot_switch("switch_create_new", &repo, &["--create", "feature-x"]);
 }
 
+#[cfg(target_os = "macos")]
+fn configure_snapshot_template(repo: &TestRepo) -> PathBuf {
+    let template = repo.home_path().join("template");
+    repo.run_git(&[
+        "clone",
+        "--",
+        repo.root_path().to_str().unwrap(),
+        template.to_str().unwrap(),
+    ]);
+    repo.write_test_config(&format!(
+        "[switch]\nsnapshot-from = {:?}\n",
+        template.to_str().unwrap()
+    ));
+    template
+}
+
 /// A clean standalone checkout provides ignored files while Git still owns
 /// the new branch, index, and linked-worktree registration.
 #[cfg(target_os = "macos")]
@@ -72,19 +88,9 @@ fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
     repo.run_git(&["add", ".gitignore"]);
     repo.run_git(&["commit", "-m", "Ignore dependencies"]);
 
-    let template = repo.home_path().join("template");
-    repo.run_git(&[
-        "clone",
-        "--",
-        repo.root_path().to_str().unwrap(),
-        template.to_str().unwrap(),
-    ]);
+    let template = configure_snapshot_template(&repo);
     fs::create_dir(template.join("node_modules")).unwrap();
     fs::write(template.join("node_modules/cache.txt"), "shared\n").unwrap();
-    repo.write_test_config(&format!(
-        "[switch]\nsnapshot-from = {:?}\n",
-        template.to_str().unwrap()
-    ));
 
     let output = repo
         .wt_command()
@@ -110,23 +116,29 @@ fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
         fs::read_to_string(template.join("node_modules/cache.txt")).unwrap(),
         "shared\n"
     );
+    fs::write(worktree.join("node_modules/cache.txt"), "local\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(template.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+
+    let removed = repo
+        .wt_command()
+        .args(["remove", "snapshot", "--yes", "--foreground"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!worktree.exists());
 }
 
 #[cfg(target_os = "macos")]
 #[rstest]
-fn test_switch_snapshot_rejects_dirty_template_and_falls_back_on_new_commit(repo: TestRepo) {
-    let template = repo.home_path().join("template");
-    repo.run_git(&[
-        "clone",
-        "--",
-        repo.root_path().to_str().unwrap(),
-        template.to_str().unwrap(),
-    ]);
-    repo.write_test_config(&format!(
-        "[switch]\nsnapshot-from = {:?}\n",
-        template.to_str().unwrap()
-    ));
-
+fn test_switch_snapshot_rejects_dirty_template(repo: TestRepo) {
+    let template = configure_snapshot_template(&repo);
     fs::write(template.join("file.txt"), "dirty template\n").unwrap();
     let rejected = repo
         .wt_command()
@@ -145,8 +157,12 @@ fn test_switch_snapshot_rejects_dirty_template_and_falls_back_on_new_commit(repo
             .unwrap()
             .is_none()
     );
+}
 
-    // A different base commit takes Git's normal checkout path.
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_uses_git_checkout_for_new_base(repo: TestRepo) {
+    let _template = configure_snapshot_template(&repo);
     repo.commit("New base commit");
     let fallback = repo
         .wt_command()
@@ -158,11 +174,76 @@ fn test_switch_snapshot_rejects_dirty_template_and_falls_back_on_new_commit(repo
         "{}",
         String::from_utf8_lossy(&fallback.stderr)
     );
+    assert!(String::from_utf8_lossy(&fallback.stderr).contains("normal Git checkout"));
     let worktree = repo.home_path().join("repo.new-base");
     assert_eq!(
         fs::read_to_string(worktree.join("file.txt")).unwrap(),
         "New base commit"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_checks_template_with_inherited_git_dir(repo: TestRepo) {
+    let template = configure_snapshot_template(&repo);
+    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
+    let output = repo
+        .wt_command()
+        .env("GIT_DIR", repo.root_path().join(".git"))
+        .env("GIT_WORK_TREE", repo.root_path())
+        .args(["switch", "--create", "must-not-exist", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("tracked changes"));
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_checks_template_before_clobber(repo: TestRepo) {
+    let template = configure_snapshot_template(&repo);
+    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
+    let occupant = repo.home_path().join("repo.must-not-exist");
+    fs::create_dir(&occupant).unwrap();
+    fs::write(occupant.join("keep.txt"), "keep\n").unwrap();
+    let output = repo
+        .wt_command()
+        .args([
+            "switch",
+            "--create",
+            "must-not-exist",
+            "--clobber",
+            "--no-cd",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(occupant.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_rejects_submodules(repo: TestRepo) {
+    let head = repo
+        .git_command()
+        .args(["rev-parse", "HEAD"])
+        .run()
+        .unwrap();
+    let head = String::from_utf8_lossy(&head.stdout);
+    let gitlink = format!("160000,{},vendor/module", head.trim());
+    repo.run_git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+    repo.run_git(&["commit", "-m", "Add gitlink"]);
+    let _template = configure_snapshot_template(&repo);
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "must-not-exist", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("submodules"));
 }
 
 /// Test that delayed streaming shows progress message when threshold is 0.
