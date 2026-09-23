@@ -18,7 +18,7 @@ Reference files are synced from [worktrunk.dev](https://worktrunk.dev) documenta
 - **reference/switch.md**, **merge.md**, **list.md**, etc.: Command documentation
 - **reference/extending.md**: Aliases, multi-step pipelines, custom subcommands, and template-expansion gotchas (two-pass `{% raw %}` deferral, for-each recipes)
 - **reference/llm-commits.md**: LLM commit message generation
-- **reference/tips-patterns.md**: Practical recipes — aliases, per-branch variables, dev server per worktree, parallel agent patterns
+- **reference/tips-patterns.md**: Practical recipes — automatic APFS copies, aliases, per-branch variables, dev server per worktree, parallel agent patterns
 - **reference/shell-integration.md**: Shell integration debugging
 - **reference/troubleshooting.md**: Troubleshooting for LLM and hooks (Claude-specific)
 
@@ -50,6 +50,12 @@ Worktrunk uses two config files with different scopes and permission models:
 **Project config** (`<repo>/.config/wt.toml`, checked into git) holds team-wide automation: hooks for the worktree lifecycle (pre-start, pre-merge, etc.). Edit proactively — changes are versioned and reversible via git. Comment why each hook exists, and warn the user before adding destructive commands (`rm -rf`, `DROP TABLE`), network fetches piped to shells, or `sudo`. See `reference/hook.md`.
 
 Some requests span both: commit-message generation is user config, while the team's quality checks are project config.
+
+## Automatic APFS copies in this fork
+
+On macOS, `wt switch --create` looks for a clean checkout with a root `node_modules/`, `target/`, or `.venv/` cache. It prefers a linked worktree at the selected commit, then a sibling `.wt-templates/<repo-name>/` checkout, then older worktrees. Git updates tracked files to the selected branch head or base commit. If no source works, `wt` uses a normal checkout. No snapshot setting is needed.
+
+The automatic copy keeps those cache directories and removes other ignored and untracked files. Files inside the cache directories still cross into the new worktree. For pnpm or Bun, use a blocking `pre-start` install hook when the worktree must be ready before an agent starts; copied executable paths and packages may need repair. A personal hook belongs in user config and does not require a project commit. Read `reference/tips-patterns.md#automatic-apfs-worktree-copies` for the optional `snapshot = false` and `snapshot-from` settings.
 
 ## Core workflows
 
