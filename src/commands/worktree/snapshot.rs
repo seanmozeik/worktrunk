@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use worktrunk::git::{CommandError, Repository};
+use worktrunk::path::format_path_for_display;
 use worktrunk::shell_exec::Cmd;
 
 #[cfg(target_os = "macos")]
@@ -279,9 +280,8 @@ fn git_at(path: &Path, args: &[&str]) -> anyhow::Result<String> {
 impl PreparedSnapshot {
     /// Replace the empty `--no-checkout` worktree with the staged tree. Both
     /// renames stay on one volume. Keep the empty directory for rollback.
-    pub(super) fn install(self, repo: &Repository, destination: &Path) -> anyhow::Result<()> {
+    pub(super) fn install(mut self, repo: &Repository, destination: &Path) -> anyhow::Result<()> {
         let staged = self.temporary.path().join("tree");
-        let empty = self.temporary.path().join("empty-worktree");
         let linked = repo.worktree_at(destination);
         let actual_commit = linked.run_command(&["rev-parse", "HEAD"])?;
         if actual_commit.trim() != self.target_commit {
@@ -308,17 +308,7 @@ impl PreparedSnapshot {
             .create_new(true)
             .open(staged.join(".git"))?
             .write_all(&pointer)?;
-        fs::rename(destination, &empty)?;
-        if let Err(error) = renamore::rename_exclusive(&staged, destination) {
-            if let Err(restore_error) = renamore::rename_exclusive(&empty, destination) {
-                let recovery = self.temporary.keep().join("empty-worktree");
-                bail!(
-                    "Cannot install APFS snapshot ({error}); cannot restore worktree ({restore_error}); original Git pointer kept at {}",
-                    recovery.display()
-                );
-            }
-            return Err(error).context("Cannot install APFS snapshot");
-        }
+        replace_worktree(&mut self.temporary, destination)?;
         // `git worktree add --no-checkout` leaves an empty index. Populate it
         // from HEAD without touching the copied working files.
         let installed = repo.worktree_at(destination);
@@ -336,5 +326,124 @@ impl PreparedSnapshot {
             self.target_commit
         );
         Ok(())
+    }
+}
+
+/// Replace a newly registered worktree without recursively deleting its old
+/// directory: another process can add files after the caller checked it.
+#[cfg(target_os = "macos")]
+fn replace_worktree(temporary: &mut tempfile::TempDir, destination: &Path) -> anyhow::Result<()> {
+    let staged = temporary.path().join("tree");
+    let original = temporary.path().join("empty-worktree");
+    // From the rename until rollback or rmdir succeeds, this directory can
+    // contain user files. Every early return must leave those files on disk.
+    temporary.disable_cleanup(true);
+    if let Err(error) = fs::rename(destination, &original) {
+        temporary.disable_cleanup(false);
+        return Err(error).context("Cannot move new worktree for APFS snapshot installation");
+    }
+    if let Err(error) = renamore::rename_exclusive(&staged, destination) {
+        if let Err(restore_error) = renamore::rename_exclusive(&original, destination) {
+            bail!(
+                "Cannot install APFS snapshot ({error}); cannot restore worktree ({restore_error}); original worktree kept @ {}",
+                format_path_for_display(&original)
+            );
+        }
+        temporary.disable_cleanup(false);
+        return Err(error).context("Cannot install APFS snapshot");
+    }
+    if !fs::symlink_metadata(&original)?.file_type().is_dir() {
+        bail!(
+            "APFS snapshot installed, but the original worktree path changed; inspect it @ {}",
+            format_path_for_display(&original)
+        );
+    }
+    // The installed copy now holds the Git pointer. rmdir refuses any files
+    // that arrived in the old directory, including through an open handle.
+    fs::remove_file(original.join(".git"))
+        .and_then(|()| fs::remove_dir(&original))
+        .with_context(|| {
+            format!(
+                "APFS snapshot installed, but the original worktree has remaining files; inspect them @ {}",
+                format_path_for_display(&original)
+            )
+        })?;
+    temporary.disable_cleanup(false);
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replacement_keeps_files_created_after_validation() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("worktree");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join(".git"), "gitdir: metadata\n").unwrap();
+        // Model a writer arriving after install's only-.git check.
+        fs::write(destination.join("work.txt"), "concurrent work\n").unwrap();
+        let mut temporary = tempfile::tempdir_in(parent.path()).unwrap();
+        let recovery = temporary.path().join("empty-worktree");
+        let staged = temporary.path().join("tree");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join(".git"), "gitdir: metadata\n").unwrap();
+
+        let error = replace_worktree(&mut temporary, &destination).unwrap_err();
+        drop(temporary);
+
+        assert!(error.to_string().contains("remaining files"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format_path_for_display(&recovery))
+        );
+        assert_eq!(
+            fs::read_to_string(recovery.join("work.txt")).unwrap(),
+            "concurrent work\n"
+        );
+        assert!(destination.join(".git").is_file());
+    }
+
+    #[test]
+    fn failed_replacement_restores_files_created_after_validation() {
+        let parent = tempfile::tempdir().unwrap();
+        let destination = parent.path().join("worktree");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join(".git"), "gitdir: metadata\n").unwrap();
+        fs::write(destination.join("work.txt"), "concurrent work\n").unwrap();
+        let mut temporary = tempfile::tempdir_in(parent.path()).unwrap();
+        let temporary_path = temporary.path().to_path_buf();
+        // No staged tree: installation fails after moving the original.
+        assert!(replace_worktree(&mut temporary, &destination).is_err());
+        drop(temporary);
+
+        assert_eq!(
+            fs::read_to_string(destination.join("work.txt")).unwrap(),
+            "concurrent work\n"
+        );
+        assert!(destination.join(".git").is_file());
+        assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn replacement_does_not_follow_a_replaced_worktree_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let other = parent.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join(".git"), "another repository\n").unwrap();
+        let destination = parent.path().join("worktree");
+        std::os::unix::fs::symlink(&other, &destination).unwrap();
+        let mut temporary = tempfile::tempdir_in(parent.path()).unwrap();
+        fs::create_dir(temporary.path().join("tree")).unwrap();
+
+        assert!(replace_worktree(&mut temporary, &destination).is_err());
+        drop(temporary);
+
+        assert_eq!(
+            fs::read_to_string(other.join(".git")).unwrap(),
+            "another repository\n"
+        );
     }
 }
