@@ -317,6 +317,25 @@ Use `pre-start` instead when an `--execute` command needs the copied files immed
 
 All gitignored files are copied by default. To limit what gets copied, create `.worktreeinclude` with patterns — files must be both gitignored and listed. See [`wt step copy-ignored`](/step/#wt-step-copy-ignored) for details.
 
+#### APFS snapshot creation (fork feature)
+
+On macOS with APFS, this fork can clone a prepared standalone checkout when `wt switch --create` starts at the same commit. Put the source path in your personal Worktrunk config:
+
+```toml
+[projects."github.com/SharedGenes/chronic-care-chat".switch]
+snapshot-from = "/absolute/path/to/clean-juno-template"
+```
+
+The template must have a `.git` directory and no tracked changes. The snapshot includes ignored files, so use a dedicated template without secrets or unrelated output. When the requested base differs from the template commit, Worktrunk uses a normal Git checkout. Existing branches and worktrees use the usual path. The new worktree remains linked to the shared Git repository.
+
+For pnpm projects, run a blocking `pre-start` install after the snapshot. pnpm executable wrappers can contain absolute paths back to the template:
+
+```toml
+# .config/wt.toml in the project
+[pre-start]
+install = "pnpm install --frozen-lockfile --prefer-offline"
+```
+
 ### Subdomain routing with Caddy
 
 <!-- Hand-tested 2026-03-07 -->

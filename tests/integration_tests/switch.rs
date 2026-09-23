@@ -63,6 +63,108 @@ fn test_switch_create_new_branch(repo: TestRepo) {
     snapshot_switch("switch_create_new", &repo, &["--create", "feature-x"]);
 }
 
+/// A clean standalone checkout provides ignored files while Git still owns
+/// the new branch, index, and linked-worktree registration.
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_create_from_apfs_snapshot(repo: TestRepo) {
+    fs::write(repo.root_path().join(".gitignore"), "node_modules/\n").unwrap();
+    repo.run_git(&["add", ".gitignore"]);
+    repo.run_git(&["commit", "-m", "Ignore dependencies"]);
+
+    let template = repo.home_path().join("template");
+    repo.run_git(&[
+        "clone",
+        "--",
+        repo.root_path().to_str().unwrap(),
+        template.to_str().unwrap(),
+    ]);
+    fs::create_dir(template.join("node_modules")).unwrap();
+    fs::write(template.join("node_modules/cache.txt"), "shared\n").unwrap();
+    repo.write_test_config(&format!(
+        "[switch]\nsnapshot-from = {:?}\n",
+        template.to_str().unwrap()
+    ));
+
+    let output = repo
+        .wt_command()
+        .args(["switch", "--create", "snapshot", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let worktree = repo.home_path().join("repo.snapshot");
+    assert_eq!(
+        fs::read_to_string(worktree.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+    assert!(worktree.join(".git").is_file());
+    assert!(repo.repo.worktree_for_branch("snapshot").unwrap().is_some());
+    let linked = worktrunk::git::Repository::at(&worktree).unwrap();
+    assert_eq!(linked.run_command(&["status", "--porcelain"]).unwrap(), "");
+    fs::write(worktree.join("node_modules/cache.txt"), "local\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(template.join("node_modules/cache.txt")).unwrap(),
+        "shared\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[rstest]
+fn test_switch_snapshot_rejects_dirty_template_and_falls_back_on_new_commit(repo: TestRepo) {
+    let template = repo.home_path().join("template");
+    repo.run_git(&[
+        "clone",
+        "--",
+        repo.root_path().to_str().unwrap(),
+        template.to_str().unwrap(),
+    ]);
+    repo.write_test_config(&format!(
+        "[switch]\nsnapshot-from = {:?}\n",
+        template.to_str().unwrap()
+    ));
+
+    fs::write(template.join("file.txt"), "dirty template\n").unwrap();
+    let rejected = repo
+        .wt_command()
+        .args(["switch", "--create", "must-not-exist", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("tracked changes"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        repo.repo
+            .worktree_for_branch("must-not-exist")
+            .unwrap()
+            .is_none()
+    );
+
+    // A different base commit takes Git's normal checkout path.
+    repo.commit("New base commit");
+    let fallback = repo
+        .wt_command()
+        .args(["switch", "--create", "new-base", "--no-cd"])
+        .output()
+        .unwrap();
+    assert!(
+        fallback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    let worktree = repo.home_path().join("repo.new-base");
+    assert_eq!(
+        fs::read_to_string(worktree.join("file.txt")).unwrap(),
+        "New base commit"
+    );
+}
+
 /// Test that delayed streaming shows progress message when threshold is 0.
 /// This exercises the streaming code path that normally only triggers for slow operations.
 #[rstest]
